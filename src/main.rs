@@ -1,9 +1,15 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::channel;
+use std::sync::mpsc::sync_channel;
 use std::thread;
 
 #[derive(Debug)]
@@ -13,6 +19,11 @@ enum RESPData {
     Integers(i64),
     BulkStrings(String),
     Arrays(Vec<String>),
+}
+
+enum Commands {
+    Set(String, String),
+    Get(String, SyncSender<String>),
 }
 
 fn encode(msg: &str) -> Vec<u8> {
@@ -33,19 +44,48 @@ fn decode(data: &[u8]) -> RESPData {
     }
 }
 
-fn handle_stream(mut stream: TcpStream) {
+fn manage_store(mut store: HashMap<String, String>, rx: Receiver<Commands>) {
+    for received in rx {
+        match received {
+            Commands::Set(k, v) => {
+                store.insert(k, v);
+            }
+            Commands::Get(k, tx) => {
+                let v = store.get(&k).unwrap().to_owned();
+                tx.send(v).unwrap();
+            }
+        };
+    }
+}
+
+fn handle_stream(mut stream: TcpStream, tx: Sender<Commands>) {
     println!("connected {}", stream.peer_addr().unwrap());
     loop {
         let mut buffer = [0_u8; 1024];
         match stream.read(&mut buffer) {
             Ok(n) if n > 0 => {
                 let respd = decode(&buffer[..n]);
+                // println!("respd: {:?}", respd);
                 match respd {
                     RESPData::Arrays(v) if v.first().unwrap().to_uppercase() == "ECHO" => {
-                        stream.write(&encode(&v[2])).unwrap()
+                        // println!("to reply: {}", &v[2]);
+                        stream.write(&encode(&v[2])).unwrap();
+                    }
+                    RESPData::Arrays(v) if v.first().unwrap().to_uppercase() == "SET" => {
+                        let k = &v[2];
+                        let v = &v[4];
+                        tx.send(Commands::Set(k.to_owned(), v.to_owned())).unwrap();
+                        stream.write(&encode("OK")).unwrap();
+                    }
+                    RESPData::Arrays(v) if v.first().unwrap().to_uppercase() == "GET" => {
+                        let k = &v[2];
+                        let (mtx, mrx) = sync_channel(0);
+                        tx.send(Commands::Get(k.to_owned(), mtx)).unwrap();
+                        let v = mrx.recv().unwrap();
+                        stream.write(&encode(&v)).unwrap();
                     }
                     RESPData::SimpleStrings(_) | RESPData::Arrays(_) => {
-                        stream.write(&encode("PONG")).unwrap()
+                        stream.write(&encode("PONG")).unwrap();
                     }
                     _ => unimplemented!(),
                 };
@@ -61,10 +101,15 @@ fn handle_stream(mut stream: TcpStream) {
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
 
+    let (tx, rx) = channel();
+    let hm = HashMap::new();
+    thread::spawn(move || manage_store(hm, rx));
+
     for stream in listener.incoming() {
+        let tx = tx.clone();
         match stream {
             Ok(stream) => {
-                thread::spawn(move || handle_stream(stream));
+                thread::spawn(move || handle_stream(stream, tx));
             }
             Err(e) => println!("couldn't get client: {e:?}"),
         }
