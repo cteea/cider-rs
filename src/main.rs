@@ -5,12 +5,13 @@ use std::io::Read;
 use std::io::Write;
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::sync::mpsc::channel;
+use std::sync::mpsc::sync_channel;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::SyncSender;
-use std::sync::mpsc::channel;
-use std::sync::mpsc::sync_channel;
 use std::thread;
+use std::time::SystemTime;
 
 #[derive(Debug)]
 enum RESPData {
@@ -22,12 +23,24 @@ enum RESPData {
 }
 
 enum Commands {
-    Set(String, String),
+    Set(String, String, Option<u128>),
     Get(String, SyncSender<String>),
 }
 
 fn encode(msg: &str) -> Vec<u8> {
-    Vec::from(format!("+{}\r\n", msg).as_bytes())
+    if msg.starts_with("$") {
+        msg.as_bytes().to_vec()
+    } else {
+        Vec::from(format!("+{}\r\n", msg).as_bytes())
+    }
+}
+
+// Returns the number of milliseconds since Unix epoch.
+fn time_now() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
 }
 
 fn decode(data: &[u8]) -> RESPData {
@@ -44,15 +57,31 @@ fn decode(data: &[u8]) -> RESPData {
     }
 }
 
-fn manage_store(mut store: HashMap<String, String>, rx: Receiver<Commands>) {
+fn manage_store(mut store: HashMap<String, (String, Option<u128>)>, rx: Receiver<Commands>) {
     for received in rx {
         match received {
-            Commands::Set(k, v) => {
-                store.insert(k, v);
+            Commands::Set(k, v, None) => {
+                store.insert(k, (v, None));
+            }
+            Commands::Set(k, v, Some(px)) => {
+                let expiry = px + time_now();
+                println!("expiry {}", expiry);
+                store.insert(k, (v, Some(expiry)));
             }
             Commands::Get(k, tx) => {
                 let v = store.get(&k).unwrap().to_owned();
-                tx.send(v).unwrap();
+                match v.1 {
+                    Some(x) => {
+                        if time_now() >= x {
+                            tx.send("$-1".to_string()).unwrap();
+                        } else {
+                            tx.send(v.0).unwrap();
+                        }
+                    }
+                    None => {
+                        tx.send(v.0).unwrap();
+                    }
+                }
             }
         };
     }
@@ -65,16 +94,25 @@ fn handle_stream(mut stream: TcpStream, tx: Sender<Commands>) {
         match stream.read(&mut buffer) {
             Ok(n) if n > 0 => {
                 let respd = decode(&buffer[..n]);
-                // println!("respd: {:?}", respd);
+                println!("respd: {:?}", respd);
                 match respd {
                     RESPData::Arrays(v) if v.first().unwrap().to_uppercase() == "ECHO" => {
-                        // println!("to reply: {}", &v[2]);
+                        println!("to reply: {}", &v[2]);
                         stream.write(&encode(&v[2])).unwrap();
                     }
                     RESPData::Arrays(v) if v.first().unwrap().to_uppercase() == "SET" => {
                         let k = &v[2];
-                        let v = &v[4];
-                        tx.send(Commands::Set(k.to_owned(), v.to_owned())).unwrap();
+                        let px = v
+                            .iter()
+                            .enumerate()
+                            .find(|(_, x)| x.to_ascii_uppercase() == "PX");
+                        let v = match px {
+                            Some((idx, _)) => {
+                                (String::from(&v[4]), str::parse::<u128>(&v[idx + 2]).ok())
+                            }
+                            None => (String::from(&v[4]), None),
+                        };
+                        tx.send(Commands::Set(k.to_owned(), v.0, v.1)).unwrap();
                         stream.write(&encode("OK")).unwrap();
                     }
                     RESPData::Arrays(v) if v.first().unwrap().to_uppercase() == "GET" => {
